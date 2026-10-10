@@ -9,6 +9,7 @@ Network devices" boundary (device_client.py).
 """
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from tools.bgp_state import BGPStateTool
@@ -18,6 +19,13 @@ from tools.config import ConfigTool
 from rules_db.rules_db import RulesDB
 
 app = FastAPI(title="Tool Cohort API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
 rules_db = RulesDB()
 bgp_tool = BGPStateTool()
