@@ -1,0 +1,37 @@
+[
+  {
+    "id": "r1",
+    "name": "Router 1",
+    "host": "127.0.0.1",
+    "ip": "172.20.20.2",
+    "port": 2221,
+    "asn": 65001,
+    "peer": "172.20.20.3",
+    "peers": ["172.20.20.3"],
+    "rid": "1.1.1.1",
+    "platform": "FRR",
+    "enabled": true
+  },
+  {
+    "id": "r2",
+    "name": "Router 2",
+    "host": "127.0.0.1",
+    "ip": "172.20.20.3",
+    "port": 2222,
+    "asn": 65002,
+    "peer": "172.20.20.2",
+    "peers": ["172.20.20.2"],
+    "rid": "2.2.2.2",
+    "platform": "FRR",
+    "enabled": true
+  },
+  {
+    "id": "r3",
+    "name": "Router 3",
+    "host": "127.0.0.1",
+    "ip": "172.20.20.4",
+    "port": 2223,
+    "platform": "FRR",
+    "enabled": true
+  }
+]

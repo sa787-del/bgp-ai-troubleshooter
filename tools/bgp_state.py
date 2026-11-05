@@ -1,100 +1,88 @@
 """
-BGP Collect tool.
-
-Scope:
-- Collect BGP operational output from an FRR device.
-- Keep device connectivity in the existing FRRDeviceClient.
-- Keep parsing separate from collection.
-- Do not modify the REST API, interface, TCP, config, or rules-db layers.
+tool1: BGP state
+Purpose: send bgp state -> runs `show bgp summary` on the FRR node via vtysh
+and parses out each peer's state (Established, Active, Connect, Idle...).
 """
 
+import ipaddress
 import re
-from typing import Optional
 
 from tools.base_tool import BaseTool, ToolResult
+
+ROUTER_ID_RE = re.compile(r"BGP router identifier (?P<id>[\d.]+)")
 
 
 class BGPStateTool(BaseTool):
     tool_id = "bgp_state"
 
-    # Commands belonging to the BGP Collect scope.
-    COLLECT_COMMANDS = {
-        "summary": "show bgp summary",
-        "neighbors": "show bgp neighbors",
-        "routes": "show bgp ipv4 unicast",
-    }
-
-    def run(self, host: str, peer: Optional[str] = None) -> ToolResult:
-        """
-        Preserve the existing tool/API contract:
-        run() collects and parses BGP summary.
-        """
-        result = self.device_client.run_vtysh(
-            host, self.COLLECT_COMMANDS["summary"]
-        )
-        parsed = self._parse_summary(result.output, peer)
+    def run(self, host: str, peer: str | None = None) -> ToolResult:
+        result = self.device_client.run_vtysh(host, "show bgp summary")
+        parsed = self._parse(result.output, peer)
         return self._wrap(host, result, parsed)
 
-    def collect(self, host: str) -> dict:
-        """
-        Collect all BGP operational data required by the Collect stage.
-
-        Returns raw command output only. Parsing remains a separate concern.
-        Each command is executed through the existing device_client.
-        """
-        collected = {}
-
-        for name, command in self.COLLECT_COMMANDS.items():
-            result = self.device_client.run_vtysh(host, command)
-
-            collected[name] = {
-                "command": command,
-                "success": result.success,
-                "raw_output": result.output,
-                "error": result.error,
-            }
-
-        return collected
-
-    def _parse_summary(self, output: str, peer: Optional[str]) -> dict:
-        """
-        Parse FRR 'show bgp summary'.
-
-        FRR's State/PfxRcd field is column 9 in the peer row. Current FRR
-        versions may print '(Policy)' and additional columns after it.
-        """
-        peers = {}
-        ip_re = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+    def _parse(self, output: str, peer: str | None) -> dict:
+        # FRR "show bgp summary" prints a fixed-order table:
+        #   Neighbor V AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down State/PfxRcd [PfxSnt] [Desc]
+        #      0     1  2    3       4      5     6   7      8          9          10      11
+        # Column 9 (State/PfxRcd) carries the state and stays at the same index
+        # no matter how many extra columns a given FRR version prints after it.
+        # "Idle (Admin)", "Idle (PfxCt)", "(Policy)": the reason goes in state_reasons
+        # "NoNeg": the session is up but no address family was negotiated with the peer
+        # (e.g. `no neighbor X activate`), so no prefixes are exchanged.
+        # A long IPv6 neighbor address is printed alone and the row continues on
+        # the next line; join the two before reading columns.
+        # Column 8 (Up/Down) is kept per peer: a young Established session was just reset.
+        peers, reasons, uptimes = {}, {}, {}
+        pending = None
 
         for line in output.splitlines():
             fields = line.split()
-
-            if len(fields) < 10 or not ip_re.match(fields[0]):
+            if pending:
+                fields, pending = [pending] + fields, None
+            if len(fields) == 1 and _is_ip(fields[0]):
+                pending = fields[0]
+                continue
+            # a real peer line starts with an IP and has at least 10 columns
+            if len(fields) < 10 or not _is_ip(fields[0]):
                 continue
 
             neighbor = fields[0]
-            state_field = fields[9]
+            state_field = fields[9]          # the State/PfxRcd column
+            after = fields[10] if len(fields) > 10 else ""
 
-            if state_field.isdigit() or state_field == "(Policy)":
+            if state_field.isdigit() or state_field in ("(Policy)", "NoNeg"):
+                # a number = prefixes received; "(Policy)" = up but policy-filtered;
+                # "NoNeg" = up but no address family negotiated
                 state = "Established"
-            elif state_field in {
-                "Active",
-                "Connect",
-                "Idle",
-                "OpenSent",
-                "OpenConfirm",
-            }:
+                if state_field == "(Policy)":
+                    reasons[neighbor] = "Policy"
+                elif state_field == "NoNeg":
+                    reasons[neighbor] = "NoNeg"
+            elif state_field in {"Active", "Connect", "Idle", "OpenSent", "OpenConfirm"}:
                 state = state_field
-            elif state_field.startswith("Idle"):
+                if after.startswith("(") and after.endswith(")"):
+                    reasons[neighbor] = after.strip("()")
+            elif state_field.startswith("Idle"):   # e.g. "Idle(Admin)"
                 state = "Idle"
+                reasons[neighbor] = state_field[4:].strip("()") or None
             else:
-                state = state_field
+                state = state_field           # unknown -> pass through as-is
 
             peers[neighbor] = state
+            uptimes[neighbor] = fields[8]
 
-        parsed = {"peers": peers}
-
+        router_id = ROUTER_ID_RE.search(output)
+        parsed = {"peers": peers, "state_reasons": {n: r for n, r in reasons.items() if r},
+                  "uptimes": uptimes, "router_id": router_id["id"] if router_id else None}
         if peer:
             parsed["queried_peer_state"] = peers.get(peer, "unknown")
-
+            parsed["queried_peer_state_reason"] = parsed["state_reasons"].get(peer)
         return parsed
+
+
+def _is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False

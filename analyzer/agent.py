@@ -1,0 +1,474 @@
+"""LLM agent: the LLM picks each tool, reads the result and rule finding,
+and decides what to check next or concludes. Falls back to the rule chain
+if the LLM is unavailable.
+"""
+import json
+import logging
+import re
+
+from analyzer import llm_client, ml_engine, prompts, rules_engine
+from analyzer.llm_client import LLMUnavailable
+from analyzer.tool_registry import ToolCallError, ToolRegistry
+from analyzer.triage import llm_triage, route_context
+from analyzer.verdict import Verdict
+
+DEFAULT_MAX_STEPS = 6
+RAW_OUTPUT_LIMIT = 2500
+FIRST_TOOL = "bgp_state"
+MAX_REJECTS = 2   # in a row, then the LLM must conclude
+
+ROUTE_CLASSES = {"route_not_selected", "route_filtered", "route_not_received", "route_as_intended"}
+
+# config_drift is generic, so the specific config faults count as agreeing;
+# a healthy session is consistent with any route answer
+AGREES_WITH = {
+    "config_drift": {"config_drift", "remote_as_mismatch", "neighbor_shutdown", "neighbor_missing",
+                     "auth_mismatch", "max_prefix_exceeded", "capability_mismatch", "router_id_conflict",
+                     "afi_not_negotiated"},
+    "healthy": {"healthy"} | ROUTE_CLASSES,
+    "no_route_to_peer": {"no_route_to_peer", "interface_down", "tcp_unreachable"},
+    "peer_not_listening": {"peer_not_listening", "tcp_unreachable"},
+    "tcp_unreachable": {"tcp_unreachable", "peer_not_listening", "no_route_to_peer"},
+    "neighbor_passive": {"neighbor_passive", "config_drift"},
+}
+
+log = logging.getLogger(__name__)
+
+
+def investigate(client, question: str, host: str, peer: str | None,
+                max_steps: int = DEFAULT_MAX_STEPS, use_ml: bool = True,
+                trust_rules: bool = False, device_port: int | None = None) -> Verdict:
+    registry = ToolRegistry.load(client)
+    if not use_ml:
+        registry.remove("ml_classify")
+    ctx = {"host": host, "peer": peer, "question": question, "device_port": device_port, **route_context(question)}
+    run = Investigation(client, registry, question, ctx, max_steps, use_ml, trust_rules)
+    try:
+        return run.run()
+    except LLMUnavailable as e:
+        where = f" after {len(run.steps)} step(s)" if run.steps else ""
+        log.warning("LLM agent unavailable%s: %s; falling back to the rule chain", where, e)
+        verdict = rules_engine.diagnose(client, question, host, peer, use_ml=use_ml, use_llm=False, device_port=device_port)
+        verdict.notes.append(f"LLM agent unavailable{where} ({e}); fell back to the rule chain")
+        return verdict
+
+
+class Investigation:
+    def __init__(self, client, registry: ToolRegistry, question: str, ctx: dict,
+                 max_steps: int, use_ml: bool, trust_rules: bool):
+        self.client = client
+        self.registry = registry
+        self.question = question
+        self.ctx = ctx
+        self.max_steps = max_steps
+        self.use_ml = use_ml
+        self.trust_rules = trust_rules
+        self.model = None
+        self.triage: dict | None = None
+        self.steps: list[dict] = []
+        self.evidence: list[dict] = []
+        self.checked: list[str] = []
+        self.findings: list[dict] = []
+        self.calls: dict[tuple, int] = {}
+        self.pending_tool: tuple[str, str] | None = None
+
+    def run(self) -> Verdict:
+        log.info("Agent start: host=%s peer=%s max_steps=%d",
+                 self.ctx["host"], self.ctx["peer"], self.max_steps)
+        self.triage = llm_triage(self.question, self.ctx["host"], self.ctx["peer"], self.registry)
+        if not self.triage["in_scope"]:
+            return Verdict(False, "This doesn't look like a question about this router's BGP sessions.",
+                           "Ask about a BGP session, its peer, or the links and config behind it.",
+                           source="agent", triage=self.triage)
+        for n in range(1, self.max_steps + 1):
+            if not self.checked:
+                decision = {
+                    "action": "call_tool",
+                    "tool_id": FIRST_TOOL,
+                    "args": {},
+                    "thought": "The first investigation step is the live BGP state check required by the agent protocol.",
+                }
+            elif self.pending_tool:
+                tool_id, thought = self.pending_tool
+                self.pending_tool = None
+                decision = {"action": "call_tool", "tool_id": tool_id, "args": {}, "thought": thought}
+            else:
+                decision = self._decide(steps_left=self.max_steps - n + 1)
+            action = decision.get("action")
+            if action == "conclude":
+                problem = self._conclusion_problem(decision)
+                if problem is None:
+                    return self._verdict(decision)
+                self._reject(n, decision, problem)
+            elif action == "call_tool":
+                finding = self._call(n, decision)
+                if finding and finding.get("fault_class") == "neighbor_passive":
+                    return self._agent_confirmed_verdict(finding)
+                if finding and finding.get("decision") == "healthy":
+                    # A live BGP-state check already proves the session is up.
+                    # Don't let a later model call invent a route problem or use
+                    # the peer's management IP as a route prefix.
+                    return self._agent_confirmed_verdict(finding)
+                if (finding and finding.get("decision") == "root_cause"
+                        and self.checked and self.checked[-1] == "bgp_state"):
+                    return self._agent_confirmed_verdict(finding)
+                if self.trust_rules and finding and finding["decision"] != "continue":
+                    return self._rules_verdict(finding)
+            else:
+                self._reject(n, decision, f"action must be call_tool or conclude, not {action!r}")
+            recent = self.steps[-MAX_REJECTS:]
+            if self.evidence and len(recent) == MAX_REJECTS and all("rejected" in r for r in recent):
+                log.info("%d rejected steps in a row; asking for a conclusion", MAX_REJECTS)
+                break
+        return self._verdict(self._decide(steps_left=0))
+
+    def _decide(self, steps_left: int) -> dict:
+        schema = (prompts.step_schema(self.registry.all_args(), list(self.registry.tools)) if steps_left
+                  else prompts.conclude_schema())
+        user = prompts.step_message(self._case(), steps_left)
+        log.debug("Agent prompt:\n%s", user)
+        decision, self.model = llm_client.chat_json(prompts.SYSTEM_PROMPT, user, schema, max_tokens=512)
+        log.info("Agent decision: action=%s tool=%s args=%s intent=%s thought=%s",
+                 decision.get("action"), decision.get("tool_id"), decision.get("args"),
+                 decision.get("intent"), decision.get("thought"))
+        return decision
+
+    def _case(self) -> dict:
+        return {
+            "question": self.question,
+            "host": self.ctx["host"],
+            "peer": self.ctx["peer"],
+            "triage": self.triage,
+            "fault_classes": prompts.FAULT_CLASSES,
+            "tools": self.registry.for_prompt(),
+            "steps": [_step_for_prompt(s) for s in self.steps],
+        }
+
+    def _call(self, n: int, decision: dict) -> dict | None:
+        requested_tool = decision.get("tool_id") or ""
+        tool_id = self.registry.normalize_tool_id(requested_tool)
+        try:
+            args = self.registry.validate(tool_id, decision.get("args"))
+            if "prefix" in self.registry.tools[tool_id]["args_schema"]:
+                if self.ctx.get("prefix"):
+                    args["prefix"] = self.ctx["prefix"]
+                elif tool_id == "route_table":
+                    # Never treat the peer's address as a requested route prefix.
+                    # With no prefix in the operator's question, inspect the table.
+                    args.pop("prefix", None)
+            key = (tool_id, json.dumps(args, sort_keys=True))
+            if self.registry.tools[tool_id]["kind"] == "internal":
+                key += (len(self._device_evidence()),)
+            if key in self.calls:
+                untried = [t for t in self.registry.tools if t not in self.checked
+                           and self.registry.tools[t]["kind"] == "device"]
+                raise ToolCallError(f"{tool_id} was already called with these args in step "
+                                    f"{self.calls[key]}; use that result. Tools not called yet: "
+                                    f"{', '.join(untried) or 'none'}")
+            if (tool_id != FIRST_TOOL and FIRST_TOOL in self.registry.tools
+                    and FIRST_TOOL not in self.checked):
+                raise ToolCallError(f"call {FIRST_TOOL} first")
+        except ToolCallError as e:
+            self._reject(n, decision, str(e))
+            return None
+
+        self.calls[key] = n
+        result = self.registry.execute(self.client, tool_id, args, self.ctx, self.evidence)
+        if tool_id == "config" and result.get("success"):
+            self._check_peer_passive(result)
+        finding = rules_engine.evaluate(tool_id, result, self.ctx)
+        if (tool_id == "config" and finding["decision"] == "continue"
+                and self.ctx.get("_state") in ("Active", "Connect")
+                and not finding.get("suggested_next_intent")):
+            finding["suggested_next_intent"] = "bgp_neighbor_detail"
+        if finding["decision"] == "continue" and "hint" not in finding:
+            finding["suggested_next_intent"] = self.registry.next_intent_after(tool_id)
+        if finding.get("suggested_next_intent"):
+            # bgp_state points at bgp_state_<state>, whose only tool is bgp_state again: the model
+            # followed it, got rejected as a duplicate and was forced to conclude. Skip to the first
+            # intent with a tool that hasn't run yet.
+            finding["suggested_next_intent"] = self._next_new_intent(finding["suggested_next_intent"],
+                                                                     self.checked + [tool_id])
+        # A real rule finding can choose the next executable tool without another
+        # model round-trip. The model remains responsible for ambiguous conclusions.
+        if finding["decision"] == "continue":
+            next_tool = self.registry.tool_for_intent(finding.get("suggested_next_intent"))
+            if next_tool and next_tool not in self.checked and next_tool != tool_id:
+                self.pending_tool = (next_tool, finding.get("hint") or
+                                     f"The rule chain recommends checking {next_tool} next.")
+        if finding["decision"] == "healthy":
+            finding["note"] = ("The session is up. If the question is about the session, conclude; "
+                               "if it is about routes or prefixes, continue with route_table.")
+        elif finding["decision"] == "root_cause":
+            finding["note"] = "The rule book considers this decided. Conclude unless other evidence contradicts it."
+        summary = summarize(tool_id, result)
+        if finding["decision"] != "continue":
+            summary += f" [rule: {finding['decision']}]"
+        log.info("Step %d: %s %s -> %s", n, tool_id, args or "", summary)
+        log.debug("Step %d parsed output: %s", n, json.dumps(result.get("parsed"), sort_keys=True, default=str))
+        log.debug("Step %d raw output:\n%s", n, result.get("raw_output"))
+
+        self.checked.append(tool_id)
+        self.findings.append(finding)
+        self.evidence.append({"tool": tool_id, "success": result.get("success"),
+                              "error": result.get("error"), "parsed": result.get("parsed"),
+                              "raw_output": result.get("raw_output")})
+        self.steps.append({"n": n, "thought": decision.get("thought"), "intent": decision.get("intent"),
+                           "tool": tool_id, "args": args, "summary": summary,
+                           "result": result, "rule_finding": finding})
+        return finding
+
+    def _check_peer_passive(self, result: dict) -> None:
+        """When this neighbor is passive, inspect its real peer config as well."""
+        peer = self.ctx.get("peer")
+        local_ip = self.ctx.get("host")
+        running = result.get("raw_output") or ""
+        if not peer or not re.search(
+                rf"^\s*neighbor\s+{re.escape(peer)}\s+passive\s*$", running, re.MULTILINE):
+            return
+
+        check = {"peer": peer, "peer_neighbor": local_ip, "local_passive": True, "passive": None}
+        try:
+            devices = self.client.get_devices()
+            local = next((d for d in devices if local_ip in {d.get("ip"), d.get("host")}
+                          and (self.ctx.get("device_port") is None
+                               or d.get("port") == self.ctx.get("device_port"))), None)
+            remote = next((d for d in devices if peer in {d.get("ip"), d.get("host")}), None)
+            if local:
+                check["peer_neighbor"] = local.get("ip") or local_ip
+            if not remote:
+                check["error"] = f"Peer {peer} is not present in the enabled device inventory."
+            else:
+                response = self.client.call_tool("/tools/config/diff", {
+                    "host": remote.get("ip") or remote.get("host"),
+                    "device_port": remote["port"],
+                })
+                if not response.get("success", True):
+                    check["error"] = response.get("error") or "Peer config check failed."
+                else:
+                    peer_running = response.get("raw_output") or ""
+                    peer_neighbor = check["peer_neighbor"]
+                    check["passive"] = bool(re.search(
+                        rf"^\s*neighbor\s+{re.escape(peer_neighbor)}\s+passive\s*$",
+                        peer_running, re.MULTILINE))
+                    check["router"] = remote.get("name") or remote.get("id") or peer
+        except Exception as exc:
+            check["error"] = f"{type(exc).__name__}: {exc}"
+
+        parsed = result.get("parsed") or {}
+        parsed["peer_passive_check"] = check
+        result["parsed"] = parsed
+        state = "enabled" if check.get("passive") else "not found"
+        if check.get("error"):
+            state = f"unavailable: {check['error']}"
+        result["raw_output"] = (running.rstrip() +
+                                f"\n\nPeer config check: neighbor {check['peer_neighbor']} passive {state}")
+
+    def _next_new_intent(self, intent: str | None, ran: list[str]) -> str | None:
+        seen = set()
+        while intent and intent not in seen:
+            seen.add(intent)
+            rules = [r for r in self.registry.rules if r["intent"] == intent]
+            if not rules or any(r["tool_id"] not in ran for r in rules):
+                return intent
+            intent = min(rules, key=lambda r: r["priority"]).get("next_intent_on_fail")
+        return intent
+
+    def _reject(self, n: int, decision: dict, reason: str):
+        log.warning("Step %d rejected: %s", n, reason)
+        self.steps.append({"n": n, "thought": decision.get("thought"),
+                           "tool": decision.get("tool_id"), "args": decision.get("args"),
+                           "rejected": reason})
+
+    def _conclusion_problem(self, decision: dict) -> str | None:
+        if not self.evidence:
+            return "call at least one tool before concluding; there is no evidence yet"
+        missing = _missing_diagnosis_fields(decision)
+        if missing:
+            return f"a conclusion needs a complete diagnosis (missing {', '.join(missing)})"
+        return None
+
+    def _verdict(self, decision: dict) -> Verdict:
+        missing = _missing_diagnosis_fields(decision)
+        if missing:
+            raise LLMUnavailable(f"the model's conclusion is missing {', '.join(missing)}")
+        d = decision["diagnosis"]
+        notes = [f"Diagnosed by {self.model}"]
+        resolved = bool(d["resolved"])
+        if not self.evidence:
+            resolved = False
+            notes.append("No tool ran, so the conclusion has no evidence")
+
+        decided = [f for f in self.findings if f["decision"] != "continue"]
+        rules_agree = (any(d["fault_class"] in AGREES_WITH.get(f["fault_class"], {f["fault_class"]})
+                           for f in decided) if decided else None)
+        if rules_agree is False:
+            log.warning("Agent's fault class %s disagrees with the rule findings %s",
+                        d["fault_class"], [f["fault_class"] for f in decided])
+        log.info("Agent concluded: resolved=%s fault_class=%s confidence=%s rules_agree=%s root cause: %s",
+                 resolved, d["fault_class"], d["confidence"], rules_agree, d["root_cause"])
+
+        return Verdict(resolved, d["root_cause"], d["suggested_fix"], self.checked, self.evidence,
+                       source="agent", confidence=d["confidence"],
+                       ml_prediction=None if d["fault_class"] in ROUTE_CLASSES else self._ml_opinion(),
+                       next_checks=list(d["next_checks"]), notes=notes,
+                       fault_class=d["fault_class"], rules_agree=rules_agree,
+                       triage=self.triage, steps=self._public_steps())
+
+    def _rules_verdict(self, finding: dict) -> Verdict:
+        log.info("Rule finding %s after %s; returning the deterministic finding",
+                 finding["decision"], self.checked[-1])
+        return Verdict(True, finding["cause"], finding["fix"], self.checked, self.evidence,
+                       source="rules",
+                       ml_prediction=None if finding.get("fault_class") in {"neighbor_passive", "route_filtered"}
+                       else self._ml_opinion(),
+                       notes=["Resolved from verified device evidence by the deterministic rule engine"],
+                       fault_class=finding["fault_class"], triage=self.triage,
+                       steps=self._public_steps())
+
+    def _agent_confirmed_verdict(self, finding: dict) -> Verdict:
+        """Ask the LLM agent once to validate a decisive, compact live finding.
+
+        The verified rule result remains authoritative if the model times out or
+        disagrees; Agent mode therefore calls the agent without sacrificing the
+        fast, evidence-backed answer.
+        """
+        verdict = self._rules_verdict(finding)
+        if self.trust_rules:
+            return verdict
+        evidence = [{"tool": item.get("tool"), "parsed": item.get("parsed")}
+                    for item in self.evidence[-2:]]
+        case = {
+            "question": self.question,
+            "peer": self.ctx.get("peer"),
+            "verified_finding": {
+                "fault_class": finding.get("fault_class"),
+                "cause": finding.get("cause"),
+                "rule_decision": finding.get("decision"),
+            },
+            "live_evidence": evidence,
+        }
+        schema = json.loads(json.dumps(prompts.FAST_AGENT_DIAGNOSIS_SCHEMA))
+        schema["properties"]["fault_class"]["enum"] = [finding["fault_class"]]
+        try:
+            diagnosis, model = llm_client.chat_json(
+                prompts.FAST_AGENT_PROMPT,
+                json.dumps(case, separators=(",", ":")),
+                schema,
+                max_tokens=128,
+            )
+        except LLMUnavailable as exc:
+            verdict.notes.append(f"Agent diagnosis failed ({exc}); kept verified device diagnosis")
+            log.warning("Agent diagnosis unavailable; retaining verified finding: %s", exc)
+            return verdict
+
+        if diagnosis["fault_class"] == finding["fault_class"]:
+            verdict.source = "agent"
+            verdict.confidence = diagnosis["confidence"]
+            verdict.root_cause = diagnosis["root_cause"]
+            verdict.suggested_fix = diagnosis["suggested_fix"]
+            verdict.notes = [f"Agent {model} diagnosed the case from verified device evidence"]
+        else:
+            verdict.notes.append(f"Agent {model} could not confirm the verified fault class; kept device diagnosis")
+        log.info("Agent diagnosis: source=%s fault_class=%s confidence=%s",
+                 verdict.source, verdict.fault_class, verdict.confidence)
+        return verdict
+
+    def _device_evidence(self) -> list[dict]:
+        return [e for e in self.evidence
+                if self.registry.tools.get(e["tool"], {}).get("kind") == "device"]
+
+    def _ml_opinion(self) -> dict | None:
+        device = self._device_evidence()
+        if not (self.use_ml and device):
+            return None
+        ml = ml_engine.predict(device, self.ctx["peer"])
+        log.info("ML second opinion: %s (%.2f)", ml.label, ml.confidence)
+        return ml.to_dict()
+
+    def _public_steps(self) -> list[dict]:
+        keys = ("n", "thought", "intent", "tool", "args", "summary", "rejected")
+        return [{k: s[k] for k in keys if k in s} for s in self.steps]
+
+
+def _missing_diagnosis_fields(decision: dict) -> list[str]:
+    d = decision.get("diagnosis")
+    required = prompts.diagnosis_schema()["required"]
+    if not isinstance(d, dict):
+        return ["diagnosis"]
+    return [k for k in required if k not in d]
+
+
+def _step_for_prompt(step: dict) -> dict:
+    if "rejected" in step:
+        return {"n": step["n"], "tool": step["tool"], "args": step["args"], "rejected": step["rejected"]}
+    r = step["result"]
+    parsed = r.get("parsed") or {}
+    if step["tool"] == "config" and not parsed.get("has_baseline"):
+        parsed = {**parsed, "diff": "(no baseline; see raw_output)"}
+    shown = {"success": r.get("success"), "error": r.get("error"), "parsed": parsed}
+    if r.get("raw_output"):
+        shown["raw_output"] = _trim(r["raw_output"])
+    return {"n": step["n"], "thought": step["thought"], "intent": step["intent"], "tool": step["tool"],
+            "args": step["args"], "result": shown, "rule_finding": step["rule_finding"]}
+
+
+def _trim(text: str) -> str:
+    limit = RAW_OUTPUT_LIMIT
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [{len(text) - limit} more characters cut]"
+
+
+def summarize(tool_id: str, result: dict) -> str:
+    if not result.get("success", True):
+        return f"failed: {result.get('error')}"
+    p = result.get("parsed") or {}
+    if tool_id == "bgp_state":
+        reason = p.get("queried_peer_state_reason")
+        return f"peer {p.get('queried_peer_state', '?')}" + (f" ({reason})" if reason else "")
+    if tool_id == "bgp_neighbor":
+        if not p.get("configured", True):
+            return "not configured"
+        note = p.get("notification")
+        return f"{p.get('state')}, last reset: " + (
+            f"notification {note['direction']} ({note['error']})" if note else (p.get("last_reset") or "never"))
+    if tool_id == "interface":
+        ifaces = p.get("interfaces", {})
+        down = [n for n, i in ifaces.items() if "down" in (i.get("link_state"), i.get("admin_state"))]
+        return f"down: {', '.join(down)}" if down else f"{len(ifaces)} interface(s) up"
+    if tool_id == "tcp_port":
+        if p.get("reachable"):
+            return "port 179 reachable"
+        return "port 179 unreachable" + (f" ({p['reason']})" if p.get("reason") else "")
+    if tool_id == "config":
+        if not p.get("has_baseline"):
+            return "running config read (no baseline)"
+        if not p.get("drifted"):
+            return "matches baseline"
+        return "drifted from baseline" + (f" ({p['severity']})" if p.get("severity") else "")
+    if tool_id == "route_to_peer":
+        if not p.get("has_route"):
+            return "no route to the peer"
+        if p.get("is_default"):
+            return "only the default route matches the peer"
+        return f"route {p.get('prefix')} via {p.get('protocol')} on {p.get('interface') or p.get('next_hop')}"
+    if tool_id == "prefix_list":
+        ev = p.get("evaluation") or {}
+        denied = [n for n, e in ev.items() if e.get("action") == "deny"]
+        return f"{p.get('count', 0)} list(s)" + (f", denying {p.get('prefix')}: {', '.join(denied)}" if denied else "")
+    if tool_id == "route_table":
+        if p.get("in_table") is False:
+            return f"{p.get('prefix')} not in the BGP table"
+        best = p.get("best_path")
+        if not best:
+            return f"{p.get('path_count', 0)} path(s), none best"
+        reason = f" ({best['best_reason']})" if best.get("best_reason") else ""
+        return f"{p['path_count']} path(s), best via {best['next_hop']}{reason}"
+    if tool_id == "route_map":
+        denies = [f"{m['name']} {m['sequence']}" for m in p.get("route_maps", [])
+                  if m["action"] == "deny" and m.get("invoked")]
+        return f"{p.get('count', 0)} entries" + (f", denying: {', '.join(denies)}" if denies else "")
+    if tool_id == "ml_classify":
+        return f"{p.get('label')} ({p.get('confidence', 0):.2f})"
+    return "ok"
